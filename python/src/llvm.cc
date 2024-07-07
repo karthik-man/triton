@@ -243,8 +243,20 @@ void init_triton_llvm(py::module &&m) {
 
   m.def(
       "to_module",
-      [](mlir::ModuleOp &mod, llvm::LLVMContext &ctx) {
-        return mlir::translateModuleToLLVMIR(mod, ctx);
+      [](mlir::ModuleOp &mod, llvm::LLVMContext &ctx, const std::string triple,
+         std::string proc, std::string features) {
+        std::string error;
+        auto target = llvm::TargetRegistry::lookupTarget(triple, error);
+        llvm::TargetOptions opt;
+        std::unique_ptr<llvm::TargetMachine> machine{
+            target->createTargetMachine(triple, proc, features, opt,
+                                        llvm::Reloc::PIC_, std::nullopt,
+                                        llvm::CodeGenOptLevel::None)};
+        auto dl = machine->createDataLayout();
+        mod->setAttr(mlir::LLVM::LLVMDialect::getDataLayoutAttrName(),
+                     mlir::StringAttr::get(mod.getContext(),
+                                           dl.getStringRepresentation()));
+        return mlir::translateModuleToLLVMIR(mod, ctx, triple);
       },
       py::keep_alive<0, 2>());
 

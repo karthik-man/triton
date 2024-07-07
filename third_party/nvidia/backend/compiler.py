@@ -224,7 +224,21 @@ class CUDABackend(BaseBackend):
         # LLVM-IR (MLIR) -> LLVM-IR (LLVM)
         llvm.init_targets()
         context = llvm.context()
-        llvm_mod = llvm.to_module(mod, context)
+        proc = 'sm_90a' if capability == 90 else f'sm_{capability}'
+        ptx_version = options.ptx_version
+        if ptx_version is None:
+            _, cuda_version = _path_to_binary("ptxas")
+            ptx_version = ptx_get_version(cuda_version)
+
+        # PTX 8.3 is the max version supported by llvm 3a83162168.
+        #
+        # To check if a newer PTX version is supported, increase this value
+        # and run a test.  If it's not supported, LLVM will print a warning
+        # like "+ptx8.4 is not a recognized feature for this target".
+        llvm_ptx_version = min(83, ptx_version)
+        triple = 'nvptx64-nvidia-cuda'
+        features = f'+ptx{llvm_ptx_version}'
+        llvm_mod = llvm.to_module(mod, context, triple, proc, features)
         nvidia.set_nvvm_reflect_ftz(llvm_mod)
 
         # Set maxnreg on all kernels, if it was provided.

@@ -190,7 +190,7 @@ class HIPBackend(BaseBackend):
         # LLVM-IR (MLIR) -> LLVM-IR (LLVM)
         llvm.init_targets()
         context = llvm.context()
-        llvm_mod = llvm.to_module(mod, context)
+        llvm_mod = llvm.to_module(mod, context, amd.TARGET_TRIPLE, options.arch, '')
 
         # Set various control constants on the LLVM module so that device
         # libraries can resolve references to them.
