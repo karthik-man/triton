@@ -12,9 +12,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %3 = tt.addptr %arg0, %1 : !tt.ptr<i64>, i32
 
     // CHECK: %[[resource:.*]] = rocdl.make.buffer.rsrc %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}
+    // CHECK: llvm.fence syncscope("agent") release
     // CHECK: %[[dst:.*]] = rocdl.raw.ptr.buffer.atomic.cmpswap %{{.*}}, %{{.*}}, %[[resource]], %{{.*}}, %{{.*}}, %{{.*}} : i64
-    // CHECK: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "s_waitcnt vmcnt(0) ", ""  : () -> !llvm.void
     // CHECK: %[[dst:.*]] = rocdl.raw.ptr.buffer.atomic.cmpswap %{{.*}}, %{{.*}}, %[[resource]], %{{.*}}, %{{.*}}, %{{.*}} : i64
+    // // CHECK: llvm.fence syncscope("agent") acquire
 
     %4 = amdgpu.buffer_atomic_cas acq_rel, gpu, %val, %cmp, %3[%2] : tensor<512xi64, #blocked>
     %5 = tt.addptr %arg1, %1 : !tt.ptr<i64>, i32

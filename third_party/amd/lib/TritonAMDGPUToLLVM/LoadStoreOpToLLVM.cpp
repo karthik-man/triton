@@ -1213,7 +1213,6 @@ struct BufferAtomicCASOpConversion
     // We need to manually emit memory fences (LLVM doesn't do this for buffer
     // ops) see: https://llvm.org/docs/AMDGPUUsage.html#memory-model-gfx942
     auto memOrdering = op.getSem();
-    auto atomicMemOrdering = getMemoryOrdering(memOrdering);
     auto rel = LLVM::AtomicOrdering::release;
     auto acq = LLVM::AtomicOrdering::acquire;
 
@@ -1237,30 +1236,22 @@ struct BufferAtomicCASOpConversion
       emitAcquireFence = true;
       emitReleaseFence = true;
     }
-
+    // TODO: stride support
     Value rsrcDesc = bufferEmitter.createResourceDescriptor(llPtr);
     SmallVector<Value> loadedVals;
 
     // set the scope
     auto memScope = op.getScope();
-    auto scopeStr = "";
-    switch (memScope) {
     // System scope is not supported yet
-    case MemSyncScope::SYSTEM:
+    if (MemSyncScope::SYSTEM == memScope)
       return rewriter.notifyMatchFailure(
           op, "System memory scope is not supported for Buffer Atomic CAS");
-    case MemSyncScope::GPU:
-      scopeStr = "agent";
-      break;
-    case MemSyncScope::CTA:
-      scopeStr = "workgroup";
-      break;
-    default:
+    auto scopeStr = getAMDGPUMemScopeStr(memScope);
+    if (!scopeStr)
       return rewriter.notifyMatchFailure(
           op, "Unsupported memory scope for Buffer Atomic CAS");
-    }
 
-    StringAttr scope = mlir::StringAttr::get(loc.getContext(), scopeStr);
+    StringAttr scope = mlir::StringAttr::get(loc.getContext(), *scopeStr);
 
     if (emitReleaseFence)
       rewriter.create<LLVM::FenceOp>(loc, TypeRange{}, rel, scope);
@@ -1269,68 +1260,74 @@ struct BufferAtomicCASOpConversion
     MLIRContext *ctx = rewriter.getContext();
     GCNBuilder waitcntBuilder;
 
-    // Triton supports three scopes for atomic access
-    // 1. System
-    // 2. GPU (default)
-    // 3. CTA (i.e., threadblock or warp-group)
+    // TODO: Refactor to extract common scope and ordering code, between CAS and
+    // RMW Based on "atomicrmw" entries for "global" address-space, in the
+    // "AMDHSA Memory Model Code Sequences GFX942" table in
+    // https://llvm.org/docs/AMDGPUUsage.html#memory-model-gfx942
+    // 
+    // Note: "[buffer-atomic_0.. buffer-atomic_n]" represents a sequence 
+    // of buffer-atomic instructions that are lowered from a single tl.atomic_*
     //
-    // Currently, the AMD backend emits atomics with agent-scope.
+    // Unordered(Relaxed):
+    //   agent/workgroup: Instr seq: [buffer-atomic_0.. buffer-atomic_n]
+    //                    No scope/ordering instrs are required.
+    //   system: //TODO:
+    // Acquire:
+    //   workgroup: Instr seq: [buffer-atomic_0.. buffer-atomic_n]
+    //              All waves in the workgroup use same L1 and L2.
+    //              No scope/ordering instrs are required.
+    //   agent: Instr seq: [buffer-atomic_0.. buffer-atomic_n], s_waitcnt
+    //   vmcnt(0), buffer_inv sc1=1
+    //          Waves across an agent may use different L1 and L2.
+    //          Atomic ops bypass L1 and operate on L2.
+    //          s_waitcnt vmcnt(0) ensures that the atomicrmw has completed
+    //          before invalidating the cache. buffer_inv sc1=1 will a) L1:
+    //          invalidate cache b) L2: Invalidate non-coherently modified lines
+    //          if multiple L2s are configured, NOP otherwise. This buffer_inv
+    //          ensures that following loads do not see stale global values.
+    //   system: //TODO:
     //
-    // The following properties are used to emit proper synchronization
-    // primitives between sequential buffer atomics See: Memory Model GFX942
-    // (MI300 series)
-    // https://llvm.org/docs/AMDGPUUsage.html#memory-model-gfx942:
+    // Release:
+    //   workgroup: Instr seq: [buffer-atomic_0.. buffer-atomic_n]
+    //              All waves in the workgroup use same L1 and L2 so all
+    //              previous global writes of a waver are visible to all other
+    //              waves in the workgroup. LDS operations for all waves are
+    //              executed in a total global ordering and are observed by all
+    //              waves in the workgroup. So LDS stores issued before the
+    //              release will be visible to LDS loads after the read of the
+    //              released buffer-atomic. So, swait_cnt lgkmcnt is not
+    //              required.
+    //   agent: Instr seq: buffer_wbl2 sc1=1, s_waitcnt vmcnt(0),
+    //                     [buffer-atomic_0.. buffer-atomic_n]
+    //          buffer_wbl2 sc1=1 ensures that dirtly L2 lines are visible to
+    //          CUs that don't use the same L2. From SIMemoryLegalizer.cpp
+    //          SIGfx940CacheControl::insertRelease:
+    //            "Inserting a "S_WAITCNT vmcnt(0)" before is not required
+    //            because the
+    //             hardware does not reorder memory operations by the same wave
+    //             with respect to a following "BUFFER_WBL2". The "BUFFER_WBL2"
+    //             is guaranteed to initiate writeback of any dirty cache lines
+    //             of earlier writes by the same wave. A "S_WAITCNT vmcnt(0)" is
+    //             needed after to ensure the writeback has completed.""
+    //   system: //TODO:
     //
-    // buffer/global/flat_load/store/atomic instructions to global memory are
-    // termed vector memory operations.
+    // AcquireRelease:
+    //   Instr seq: Release scope/order insts, 
+    //              [buffer-atomic_0..buffer-atomic_n], 
+    //              Acquire scope/order instrs.
     //
-    // 1. Vector memory operations access a single vector L1 cache shared by
-    // all SIMDs a CU.
-    //    No special action is required for coherence between wavefronts in the
-    //    same work-group since they execute on the same CU.
-    //
-    // 2. Each CU has a separate request queue per channel for its associated
-    // L2.
-    //    Therefore, the vector and scalar memory operations performed by
-    //    wavefronts executing with different L1 caches and the same L2 cache
-    //    can be reordered relative to each other. A `s_waitcnt vmcnt(0)` is
-    //    required to ensure synchronization between vector memory operations of
-    //    different CUs. It ensures a previous vector memory operation has
-    //    completed before executing a subsequent vector memory or LDS operation
-    //    and so can be used to meet the requirements of acquire and release.
-    //
-    // 3. Atomic read-modify-write instructions implicitly bypass the L1 cache
-    //    (specific to gfx942)
-    //    Therefore, they do not use the sc0 bit for coherence and instead use
-    //    it to indicate if the instruction returns the original value being
-    //    updated. They do use sc1 to indicate system or agent scope coherence.
-    //    See the cache modifiers word in BufferEmitter::fillCommonArgs for
-    //    more details.
-    //
-    // In summary:
-    // 1. We have to emit memory fences (i.e., acq/rel/acq_rel) before and after
-    //    our buffer atomics.
-    // 2. Because buffer atomic rmw ops skip the l1 cache, s_waitcnt vmcnt(0) is
-    //    sufficient for synchronization between instructions.
-    //    We don't need to invalidate L1 between these ops on GFX942, just after
-    //    (i.e., we can skip `buffer_wbinvl1_vol`)
-    // 3. We don't have to explicitly write to the l2 cache because
-    //    `s_waitcnt vmcnt(0)` already does this as-per the MI300/CDNA3 ISA
-    //    docs: "Decremented for reads when the data has been written back to
-    //    the VGPRs, and for writes when the data has been written to the L2
-    //    cache. Ordering: Memory reads and writes return in the order they were
-    //    issued, including mixing reads and writes"
-    // 4. We set GLC=1, to return the old value. Atomics in GFX942 execute with
-    //    either device (default) or system scope (controlled by the sc1 flag).
-    //    This is distinct from the memory scope of the atomic (i.e, the memory
-    //    fences which appear before/after the ops).
+    // Note: The LLVM AMDGPU backend emits the right scope/ordering instructions
+    // for atomic ops but not for buffer-atomic ops (The issue seems to be with
+    // the success ordering that gets passed down to SIMemoryLegalizer), so we need
+    // to manually emit these using LLVM::FenceOp, which will then get lowered to
+    // the right scope/ordering instructions. Manually emitting these has a perf-benefit
+    // as shown in #5549: the backend emits scope/ordering instructions for each 
+    // buffer-atomic in [buffer-atomic_0.. buffer-atomic_n], which is unnecessary. 
+    // Here we can emit scope/ordering instructions only before/after
+    // [buffer-atomic_0.. buffer-atomic_n]
 
-    if (memScope == MemSyncScope::GPU) {
-      waitcntBuilder.create<>("s_waitcnt vmcnt(0)")->operator()();
-    } else if (memScope == MemSyncScope::CTA) {
-      // TODO: Within a CTA we can possibly relax this?
-      waitcntBuilder.create<>("s_waitcnt vmcnt(0)")->operator()();
-    }
+    // LLVM::FenceOp lowering will emit the required s_waitcnt vmcnt(0) instrs
+    // so, we don't need to emit them manually here
 
     // Check if the op has users, if it does we set GLC=1, otherwise GLC=0
     auto opUsers = op.getResult().getUsers();
@@ -1358,14 +1355,6 @@ struct BufferAtomicCASOpConversion
       // Track the last op, so we can emit a fenceop after the loop
       lastCASOp = loadVal.getDefiningOp();
 
-      // To sync vector memory ops between CUs within an agent, we need an
-      // s_waitcnt skip doing this on the last iteration of the loop
-      // In the relaxed memory ordering, we don't need this barrier
-      if (vecStart < numElems - vec && (emitReleaseFence || emitAcquireFence)) {
-        Value inst =
-            waitcntBuilder.launch(rewriter, lastCASOp->getLoc(), void_ty(ctx));
-        lastCASOp = inst.getDefiningOp();
-      }
       for (size_t ii = 0; ii < vec; ++ii) {
         Value vecIdx = createIndexAttrConstant(
             rewriter, loc, getTypeConverter()->getIndexType(), ii);

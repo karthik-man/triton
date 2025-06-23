@@ -293,7 +293,7 @@ struct ConvertTritonAtomicCASOpToBufferAtomicCAS
     default:
       return rewriter.notifyMatchFailure(op, "CAS with unsupported scope");
     }
-    LDBG("RMW supported scope");
+    LDBG("CAS supported scope");
 
     switch (sem) {
     case MemSemantic::RELAXED:
@@ -336,7 +336,7 @@ struct ConvertTritonAtomicCASOpToBufferAtomicCAS
       return rewriter.notifyMatchFailure(
           op, "BufferAtomicCAS requires opBitWidth >= 32");
     }
-
+    // TODO: stride support
     rewriter.replaceOpWithNewOp<triton::amdgpu::BufferAtomicCASOp>(
         op, op.getVal().getType(), basePtr, tensorOffset, op.getVal(),
         op.getCmp(), sem, scope);
