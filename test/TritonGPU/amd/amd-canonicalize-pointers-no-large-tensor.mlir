@@ -19,7 +19,43 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 // CHECK: %[[ADDPTR:.*]] = tt.addptr
 // CHECK:                = tt.load %[[ADDPTR]]
 
-// ---
+// -----
+// Verify that scf.if with mixed promotable/non-promotable pointer yields works.
+// One branch yields a fat ptr (base, offset) and the other yields a single ptr.
+// The IfOp conversion must reconcile them by materializing the fat ptr back
+// with addptr.
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: _if_select_ptr
+  tt.func public @_if_select_ptr(%arg0: !tt.ptr<bf16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg1: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<bf16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg3: i32 {tt.divisibility = 16 : i32}, %arg4: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %c9_i32 = arith.constant 9 : i32
+    %0 = tt.get_program_id x : i32
+    %1 = arith.cmpi sge, %0, %c9_i32 : i32
+    %2 = arith.muli %0, %arg3 : i32
+    %3 = tt.addptr %arg0, %2 : !tt.ptr<bf16>, i32
+    %4 = arith.muli %0, %arg4 : i32
+    %5 = tt.addptr %arg1, %4 : !tt.ptr<bf16>, i32
+    %6 = scf.if %1 -> (!tt.ptr<bf16>) {
+      scf.yield %3 : !tt.ptr<bf16>
+    } else {
+      scf.yield %5 : !tt.ptr<bf16>
+    }
+    %7 = tt.load %6 : !tt.ptr<bf16>
+    tt.store %arg2, %7 : !tt.ptr<bf16>
+    tt.return
+  }
+}
+
+// The scf.if should survive with addptr materialized inside the then branch.
+// CHECK: scf.if
+// CHECK:   tt.addptr
+// CHECK:   scf.yield
+// CHECK: } else {
+// CHECK:   scf.yield
+// CHECK: }
+// CHECK: tt.load
+
+// -----
 // Verify that a scalar select no longer crashes
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
   // CHECK-LABEL: _scalar_select
